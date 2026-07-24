@@ -38,17 +38,17 @@ out_dir = f'out_{config_name}'
 
 eval_interval = 1000
 log_interval = 1
-eval_iters = 200
+eval_iters = 2400 // model_args.get("batch_size", 12)
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+init_from = model_args.get('init_from', 'scratch') # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = True # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' + '_run_' + str(time.time())
 # data
-dataset = 'openwebtext'
-batch_size = 12
+dataset = os.environ.get('BQL_DATASET', 'openwebtext')
+batch_size = model_args.get("batch_size", 12)
 gradient_accumulation_steps = 5 * 8 * 12//batch_size # used to simulate larger batch sizes
  # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -138,7 +138,7 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
+torch.manual_seed(model_args.get("seed", 1337) + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
@@ -321,6 +321,7 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 save_checkpoint_steps = model_args.get("save_checkpoint_steps", [])
+bad_evals = 0  # consecutive elevated-val evals, for the in-process divergence guard
 
 while True:
     # determine and set the learning rate for this iteration
@@ -332,6 +333,20 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
             losses = estimate_loss(iter_num=iter_num//eval_interval)
             print(f"step {iter_num}: train loss {losses['eval_train']:.4f}, val loss {losses['eval_val']:.4f}")
+            # in-process divergence guard (compute-node side; replaces head-node monitors).
+            # non-finite or a sustained val blowup exits so SLURM --mail-type notifies.
+            vl = losses['eval_val']
+            if not math.isfinite(vl):
+                print(f"DIVERGENCE: non-finite val loss ({vl}) at step {iter_num}; stopping.", flush=True)
+                sys.exit(1)
+            if vl > best_val_loss + 0.5:
+                bad_evals += 1
+                print(f"DIVERGENCE WARNING: val {vl:.4f} is +{vl-best_val_loss:.3f} over best {best_val_loss:.4f} ({bad_evals} consecutive) at step {iter_num}", flush=True)
+                if bad_evals >= 2:
+                    print(f"DIVERGENCE: val elevated {bad_evals} evals; stopping at step {iter_num}.", flush=True)
+                    sys.exit(1)
+            else:
+                bad_evals = 0
             if wandb_log:
                 wandb.log({
                     "iter": iter_num,
@@ -406,6 +421,9 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
+        if not math.isfinite(lossf):
+            print(f"DIVERGENCE: non-finite train loss ({lossf}) at iter {iter_num}; stopping.", flush=True)
+            sys.exit(1)
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
