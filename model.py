@@ -28,12 +28,16 @@ class LayerNorm(nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_idx=None):
         super().__init__()
         assert config.n_embd % config.num_heads == 0
         self.config = config
+        self.layer_idx = layer_idx
+        # split_depth: identity query below split_layer, full-rank nonlinear query at/above it
+        self.split_late = (config.query_mode == "split_depth" and layer_idx is not None
+                           and layer_idx >= config.split_layer)
         # key, query, value projections for all heads, but in a batch
-        if self.config.query_mode in ["identity", "residual_gelu"]:
+        if self.config.query_mode in ["identity", "residual_gelu", "residual_linear", "split_depth", "routed"]:
             # reduced GPT-2 style, as per our paper
             # so we only have 2 * n_embd weights in total, instead of 3 * n_embd
             self.c_attn = nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
@@ -43,11 +47,27 @@ class CausalSelfAttention(nn.Module):
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
-        if self.config.query_mode == "residual_gelu":
+        if self.config.query_mode in ["residual_gelu", "residual_linear"] or self.split_late:
+            # split_depth late layers use a FULL-RANK bottleneck (rank d, funded by the identity
+            # queries below split_layer); the audited modes keep the paper's rank d/2
+            rank = config.n_embd if self.split_late else config.n_embd//2
             self.residual_rmsnorm_input = nn.RMSNorm(config.n_embd, eps=1e-5)
             self.residual_layernorm_output = LayerNorm(config.n_embd, bias=config.bias)
-            self.residual_in = nn.Linear(config.n_embd, config.n_embd//2, bias=config.bias)
-            self.residual_out = nn.Linear(config.n_embd//2, config.n_embd, bias=config.bias)
+            self.residual_in = nn.Linear(config.n_embd, rank, bias=config.bias)
+            self.residual_out = nn.Linear(rank, config.n_embd, bias=config.bias)
+        if self.config.query_mode == "routed":
+            # D1: same scaffold as residual_gelu (RMSNorm in, LN out, residual anchor, halved
+            # scale) with the GELU MLP swapped for a token-routed mixture of K low-rank linear
+            # query maps. K*2*d*r_e = d^2 exactly at K=8, r_e=48; router adds d*K params.
+            K, r_e = config.n_experts, config.expert_rank
+            self.residual_rmsnorm_input = nn.RMSNorm(config.n_embd, eps=1e-5)
+            self.residual_layernorm_output = LayerNorm(config.n_embd, bias=config.bias)
+            self.router = nn.Linear(config.n_embd, K, bias=False)
+            self.expert_U = nn.Parameter(torch.empty(K, config.n_embd, r_e))
+            self.expert_V = nn.Parameter(torch.empty(K, r_e, config.n_embd))
+            torch.nn.init.normal_(self.expert_U, mean=0.0, std=0.02)
+            torch.nn.init.normal_(self.expert_V, mean=0.0, std=0.02)
+            self.router_tau = nn.Parameter(torch.ones(1))
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.num_heads = config.num_heads
@@ -67,12 +87,30 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        if self.config.query_mode in ["identity","residual_gelu"]:
+        if self.config.query_mode in ["identity","residual_gelu","residual_linear","split_depth","routed"]:
             k, v = self.c_attn(x).split(self.n_embd, dim=2)
             if self.config.query_mode == "identity":
                 q = x
             elif self.config.query_mode == "residual_gelu":
                 q = x + self.residual_layernorm_output(self.residual_out(F.gelu(self.residual_in(self.residual_rmsnorm_input(x)))))
+            elif self.config.query_mode == "residual_linear":
+                # Phase 3 control (NRQ nonlinearity audit): identical wiring to residual_gelu with
+                # GELU replaced by identity. GELU is parameter-free, so this is an EXACTLY
+                # parameter-identical ablation of the nonlinearity. f(x) = LN(W2 (W1 RMSNorm(x))).
+                q = x + self.residual_layernorm_output(self.residual_out(self.residual_in(self.residual_rmsnorm_input(x))))
+            elif self.config.query_mode == "split_depth":
+                # D2: identity query below split_layer, full-rank NRQ wiring at/above it
+                if self.split_late:
+                    q = x + self.residual_layernorm_output(self.residual_out(F.gelu(self.residual_in(self.residual_rmsnorm_input(x)))))
+                else:
+                    q = x
+            elif self.config.query_mode == "routed":
+                # D1: token-routed mixture of K low-rank linear query maps (see __init__)
+                xh = self.residual_rmsnorm_input(x)
+                w = F.softmax(self.router(xh) / self.router_tau, dim=-1)            # (B,T,K)
+                low = torch.einsum("btd,kdr->btkr", xh, self.expert_U)              # (B,T,K,r_e)
+                mix = torch.einsum("btk,btkr,krd->btd", w, low, self.expert_V)      # (B,T,d)
+                q = x + self.residual_layernorm_output(mix)
         else:  # original, residual
             q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
             if self.config.query_mode == "residual":
@@ -82,6 +120,11 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2) # (B, nh, T, hs)
         k = k.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2) # (B, nh, T, hs)
+        # QK-norm (opt-in): RMSNorm Q and K over the head dim so attention logits stay bounded.
+        # Root-cause fix for the linear-query spikes; parameter-free, no new weights.
+        if self.config.qk_norm:
+            q = q * torch.rsqrt(q.pow(2).mean(-1, keepdim=True) + 1e-6)
+            k = k * torch.rsqrt(k.pow(2).mean(-1, keepdim=True) + 1e-6)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -120,10 +163,10 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_idx=None):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config, layer_idx)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -151,6 +194,8 @@ class GPTConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     grad_clip: float = 1.0
+    z_loss: float = 0.0  # softmax log-partition penalty (PaLM/T5). 0.0 = off; ~1e-4 tames logit growth / spikes
+    qk_norm: bool = False  # RMSNorm Q,K per head -> bounds attention logits (root-cause fix for spikes)
     decay_lr: bool = True
     warmup_iters: int = 2000
     lr_decay_iters: int = 600000
@@ -158,6 +203,11 @@ class GPTConfig:
     mlp_hidden_size: int = 4*768
     save_checkpoint_steps: list = None
     max_iters: int = 600000
+    seed: int = 1337
+    init_from: str = 'scratch'
+    split_layer: int = 6      # split_depth: first layer that gets the full-rank nonlinear query
+    n_experts: int = 8        # routed: number of low-rank query experts
+    expert_rank: int = 48     # routed: rank per expert (K*2*d*r_e = d^2 at 8x48 for d=768)
 
 class GPT(nn.Module):
 
@@ -171,7 +221,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -229,7 +279,16 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            logits_flat = logits.view(-1, logits.size(-1))
+            targets_flat = targets.view(-1)
+            loss = F.cross_entropy(logits_flat, targets_flat, ignore_index=-1)
+            # z-loss: penalize the softmax log-partition (logsumexp) from drifting.
+            # Bounds logit growth and suppresses loss spikes (PaLM/T5). Training only,
+            # so estimate_loss() under model.eval() still reports pure cross-entropy.
+            if self.training and self.config.z_loss > 0.0:
+                logz = torch.logsumexp(logits_flat, dim=-1)
+                mask = targets_flat != -1
+                loss = loss + self.config.z_loss * (logz[mask] ** 2).mean()
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
