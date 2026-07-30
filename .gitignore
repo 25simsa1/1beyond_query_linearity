@@ -1,0 +1,15 @@
+# training artifacts
+*.out
+*.err
+*.keep
+out_*/
+wandb/
+data/
+# results / figures
+*.png
+*.xlsx
+# scratch
+__pycache__/
+*.pyc
+*.bak_*
+*.txt
