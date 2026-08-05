@@ -26,6 +26,16 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+# --- attention logit instrumentation ---------------------------------------
+# Wortsman et al. 2309.14322 find every run whose max attention logit exceeded
+# 1e4 diverged. train.py switches this on around the eval pass only, so it costs
+# nothing during training. Measured at a few blocks; they report block 0 usually
+# carries the largest values, but we sample deeper layers too rather than assume.
+LOG_ATTN_LOGITS = False
+ATTN_LOGIT_MAX = {}
+_LOGIT_PROBE_LAYERS = set()
+
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config, layer_idx=None):
@@ -126,6 +136,15 @@ class CausalSelfAttention(nn.Module):
             q = q * torch.rsqrt(q.pow(2).mean(-1, keepdim=True) + 1e-6)
             k = k * torch.rsqrt(k.pow(2).mean(-1, keepdim=True) + 1e-6)
 
+        if LOG_ATTN_LOGITS and self.layer_idx in _LOGIT_PROBE_LAYERS:
+            with torch.no_grad():
+                # 2 batch elements is plenty for a maximum and keeps this ~67MB
+                lg = (q[:2].float() @ k[:2].float().transpose(-2, -1)) * self.config.scale
+                m = lg.abs().max().item()
+                prev = ATTN_LOGIT_MAX.get(self.layer_idx, 0.0)
+                if m > prev: ATTN_LOGIT_MAX[self.layer_idx] = m
+                del lg
+
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
@@ -225,6 +244,9 @@ class GPT(nn.Module):
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # probe first, middle and last block rather than assuming block 0 is hottest
+        _LOGIT_PROBE_LAYERS.clear()
+        _LOGIT_PROBE_LAYERS.update({0, config.n_layer // 2, config.n_layer - 1})
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
