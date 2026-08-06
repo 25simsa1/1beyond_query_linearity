@@ -26,6 +26,27 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+
+def _ph_rms(t, nh, eps=1e-5):
+    """Per-head RMS normalise (B,T,C) over the head dim. Parameter-free, same form
+    as the qk_norm applied on the linear arm."""
+    B, T, C = t.shape
+    t = t.view(B, T, nh, C // nh)
+    t = t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + eps)
+    return t.view(B, T, C)
+
+
+def _ph_rms_w(t, nh, weight, eps=1e-5):
+    """Per-head RMSNorm with a learnable gain, reusing a (C,) weight reinterpreted as
+    (nh, hs) so the parameter count matches the global LayerNorm it replaces. RMS rather
+    than LayerNorm: no mean subtraction, so the per-head mean stays a free degree of
+    freedom, and it is consistent with the qk_norm form used on the linear arm."""
+    B, T, C = t.shape
+    hs = C // nh
+    t = t.view(B, T, nh, hs)
+    t = t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + eps)
+    return (t * weight.view(1, 1, nh, hs)).view(B, T, C)
+
 # --- attention logit instrumentation ---------------------------------------
 # Wortsman et al. 2309.14322 find every run whose max attention logit exceeded
 # 1e4 diverged. train.py switches this on around the eval pass only, so it costs
@@ -102,7 +123,12 @@ class CausalSelfAttention(nn.Module):
             if self.config.query_mode == "identity":
                 q = x
             elif self.config.query_mode == "residual_gelu":
-                q = x + self.residual_layernorm_output(self.residual_out(F.gelu(self.residual_in(self.residual_rmsnorm_input(x)))))
+                _corr = self.residual_out(F.gelu(self.residual_in(self.residual_rmsnorm_input(x))))
+                if self.config.per_head_norm:
+                    q = _ph_rms(x, self.num_heads) + _ph_rms_w(_corr, self.num_heads,
+                                                              self.residual_layernorm_output.weight)
+                else:
+                    q = x + self.residual_layernorm_output(_corr)
             elif self.config.query_mode == "residual_linear":
                 # Phase 3 control (NRQ nonlinearity audit): identical wiring to residual_gelu with
                 # GELU replaced by identity. GELU is parameter-free, so this is an EXACTLY
@@ -134,6 +160,8 @@ class CausalSelfAttention(nn.Module):
         # Root-cause fix for the linear-query spikes; parameter-free, no new weights.
         if self.config.qk_norm:
             q = q * torch.rsqrt(q.pow(2).mean(-1, keepdim=True) + 1e-6)
+            k = k * torch.rsqrt(k.pow(2).mean(-1, keepdim=True) + 1e-6)
+        elif self.config.k_norm:
             k = k * torch.rsqrt(k.pow(2).mean(-1, keepdim=True) + 1e-6)
 
         if LOG_ATTN_LOGITS and self.layer_idx in _LOGIT_PROBE_LAYERS:
@@ -215,6 +243,13 @@ class GPTConfig:
     grad_clip: float = 1.0
     z_loss: float = 0.0  # softmax log-partition penalty (PaLM/T5). 0.0 = off; ~1e-4 tames logit growth / spikes
     qk_norm: bool = False  # RMSNorm Q,K per head -> bounds attention logits (root-cause fix for spikes)
+    k_norm: bool = False   # normalise K only, leaving q free. residual_gelu's
+                           # q = x + LN(f(x)) is already bounded as a sum of two
+                           # normed terms, and |q| acts as a per-token attention
+                           # temperature that norming q would discard.
+    per_head_norm: bool = False  # residual_gelu: normalise anchor and correction per
+                                 # head rather than globally, so |q_h| is hard-bounded
+                                 # instead of only bounded in expectation.
     decay_lr: bool = True
     warmup_iters: int = 2000
     lr_decay_iters: int = 600000
