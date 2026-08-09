@@ -254,6 +254,7 @@ class GPTConfig:
     warmup_iters: int = 2000
     lr_decay_iters: int = 600000
     min_lr: float = 6e-5
+    lr_schedule: str = "cosine"  # "cosine" (default) or "linear" = D2Z, Bergsma et al. 2025 (arXiv:2502.15938)
     mlp_hidden_size: int = 4*768
     save_checkpoint_steps: list = None
     max_iters: int = 600000
